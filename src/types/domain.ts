@@ -44,6 +44,14 @@ export type ProductRecord = {
   };
 };
 
+export type PagePartition = {
+  type: 'metadata' | 'section' | 'table' | 'list' | 'json-ld';
+  order: number;
+  heading?: string;
+  text?: string;
+  data?: unknown;
+};
+
 export type ExtractedPage = {
   url: string;
   title?: string;
@@ -53,6 +61,8 @@ export type ExtractedPage = {
   technologies: Technology[];
   category?: CategoryRecord;
   product?: ProductRecord;
+  partitions: PagePartition[];
+  textContent?: string;
   links: string[];
-  rawHtml: string;
+  rawHtml?: string;
 };

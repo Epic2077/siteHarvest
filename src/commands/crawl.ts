@@ -1,70 +1,96 @@
-import { crawl, discoverUrls, type CrawlProgress } from '../core/crawler.js';
-import { createSource, persistPage } from '../db/persist.js';
-import type { ExtractedPage } from '../types/domain.js';
+import { crawlDurable, type CrawlProgress } from "../core/crawler.js";
+import {
+  createCrawl,
+  finishCrawl,
+  getCrawl,
+} from "../db/crawl.js";
+import { enqueueUrls } from "../db/queue.js";
+import { createSource } from "../db/persist.js";
+import { discoverSitemapUrls } from "../core/sitemap.js";
+import { isCrawlableUrl, normalizeUrl } from "../core/url.js";
+import { selectAdapter } from "../adapters/registry.js";
 
-const FLUSH_BATCH_SIZE = Number(process.env.CRAWLER_FLUSH_BATCH ?? 20);
+export async function crawlCommand(
+  url: string,
+  maxPages: number,
+  resumeId?: string,
+  concurrency?: number,
+  batchSize?: number,
+  storeRawHtml = false,
+  productOnly = false,
+) {
+  let crawlId = resumeId;
+  let sourceId: string;
+  let effectiveProductOnly = productOnly;
 
-async function flushBatch(sourceId: string, pages: ExtractedPage[]): Promise<number> {
-  let persisted = 0;
-  for (const page of pages) {
+  if (crawlId) {
+    const existing = await getCrawl(crawlId);
+    if (!existing.source?.base_url)
+      throw new Error(`Crawl ${crawlId} has no source URL.`);
+    url = existing.source.base_url;
+    sourceId = existing.source_id;
+    // Restore product-only scope from persisted metadata so resume matches the original run.
+    effectiveProductOnly = !!(existing.metadata as Record<string, unknown>)?.productOnly;
+    console.log(`\n⏯ Resuming crawl ${crawlId} for ${url}`);
+    if (effectiveProductOnly) console.log(`  ↳ product-only scope restored`);
+  } else {
+    sourceId = await createSource(new URL(url).origin, []);
+    crawlId = await createCrawl(sourceId, { maxPages, sameOriginOnly: true, productOnly: effectiveProductOnly });
+    console.log(`\n⏳ Starting crawl ${crawlId} for ${new URL(url).origin}`);
+    if (effectiveProductOnly) console.log(`  ↳ product-only mode: filtering to product-detail and catalog pages`);
+  }
+
+  const origin = new URL(url).origin;
+  const sitemapUrls = await discoverSitemapUrls(origin);
+  const startNormalized = normalizeUrl(url, url);
+  const seeds = [url, ...sitemapUrls].flatMap((candidate) => {
     try {
-      await persistPage(sourceId, page);
-      persisted++;
-    } catch (error) {
-      console.error(`\n✗ Failed to persist ${page.url}:`, error instanceof Error ? error.message : error);
+      const normalized = normalizeUrl(candidate, url);
+      if (!isCrawlableUrl(normalized, origin)) return [];
+      // In product-only mode, filter sitemap seeds through the adapter classifier.
+      // The start URL is always kept (user's explicit input).
+      if (effectiveProductOnly && normalized !== startNormalized) {
+        const adapter = selectAdapter(normalized, []);
+        const classification = adapter.classifyUrl?.(normalized) ?? 'product';
+        if (classification === 'reject') return [];
+      }
+      return [normalized];
+    } catch {
+      return [];
     }
-  }
-  return persisted;
-}
-
-export async function crawlCommand(url: string, maxPages: number) {
-  const options = { maxPages, sameOriginOnly: true };
-
-  // ── Phase 1: Discover all reachable URLs ──────────────────────────────
-  console.log(`\n⏳ Phase 1/2 — Discovering URLs on ${new URL(url).origin} ...`);
-  const knownUrls = await discoverUrls(url, options, (found) => {
-    process.stdout.write(`\r   Found ${found} pages so far...`);
   });
-  process.stdout.write('\r' + ' '.repeat(60) + '\r');
-  console.log(`✓ Discovered ${knownUrls.length} reachable pages.\n`);
+  await enqueueUrls(crawlId, [...new Set(seeds)]);
+  console.log(`→ Seeded ${new Set(seeds).size} URL(s)`);
 
-  if (knownUrls.length === 0) {
-    console.log('No pages found. Exiting.');
-    return;
+  try {
+    const stats = await crawlDurable(url, {
+      maxPages,
+      sameOriginOnly: true,
+      crawlId,
+      productOnly: effectiveProductOnly,
+      sourceId,
+      concurrency,
+      batchSize,
+      storeRawHtml,
+      onProgress: async (progress: CrawlProgress) => {
+        const total = progress.total ?? "?";
+        process.stdout.write(
+          `\r   [${progress.current}/${total}] ${progress.type} ${progress.url}`,
+        );
+        process.stdout.write("\x1b[K");
+      },
+    });
+
+    await finishCrawl(crawlId, "completed");
+    process.stdout.write("\r" + " ".repeat(100) + "\r");
+    console.log(
+      `✓ Crawl complete. ${stats.pagesSeen} pages processed, ${stats.productsFound} products found, ${stats.errors} errors.`,
+    );
+    console.log(
+      `  Resume this run later with: siteharvest crawl ${url} --resume ${crawlId}`,
+    );
+  } catch (error) {
+    await finishCrawl(crawlId, "failed").catch(() => undefined);
+    throw error;
   }
-
-  // ── Phase 2: Crawl & extract (progress only, no DB writes yet) ───────
-  console.log(`⏳ Phase 2/2 — Crawling up to ${maxPages} pages ...\n`);
-
-  const results = await crawl(url, options, knownUrls, async (progress: CrawlProgress) => {
-    const total = progress.total ?? '?';
-    const pct = progress.total ? ` (${Math.round((progress.current / progress.total) * 100)}%)` : '';
-    process.stdout.write(`\r   [${progress.current}/${total}]${pct} ${progress.type} ${progress.url}`);
-    process.stdout.write('\x1b[K'); // clear to end of line
-  });
-
-  process.stdout.write('\r' + ' '.repeat(80) + '\r');
-  console.log(`✓ Extracted ${results.length} pages.\n`);
-
-  if (results.length === 0) {
-    console.log('No pages extracted. Exiting.');
-    return;
-  }
-
-  // ── Persist in batches ───────────────────────────────────────────────
-  console.log(`⏳ Persisting ${results.length} pages to Supabase (batch size: ${FLUSH_BATCH_SIZE}) ...\n`);
-
-  const sourceId = await createSource(new URL(url).origin, results[0].technologies);
-  let persistedCount = 0;
-
-  for (let i = 0; i < results.length; i += FLUSH_BATCH_SIZE) {
-    const batch = results.slice(i, i + FLUSH_BATCH_SIZE);
-    const batchEnd = Math.min(i + FLUSH_BATCH_SIZE, results.length);
-    process.stdout.write(`\r   Flushing ${i + 1}–${batchEnd} of ${results.length} ...`);
-    persistedCount += await flushBatch(sourceId, batch);
-  }
-
-  process.stdout.write('\r' + ' '.repeat(60) + '\r');
-  console.log(`✓ Persisted ${persistedCount} pages to Supabase.`);
-  console.log(`\n🎉 Crawl complete. ${persistedCount}/${results.length} pages saved.`);
 }

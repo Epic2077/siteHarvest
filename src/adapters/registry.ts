@@ -1,14 +1,7 @@
 import type { ExtractedPage } from '../types/domain.js';
 import type { SiteAdapter } from './types.js';
 import { genericAdapter } from './generic.js';
-
-const darukadeAdapter: SiteAdapter = {
-  name: 'darukade',
-  matches: (url) => {
-    try { return new URL(url).hostname.endsWith('darukade.com'); } catch { return false; }
-  },
-  discoverUrls: (page) => page.links,
-};
+import { darukadeAdapter } from './darukade.js';
 
 const adapters: SiteAdapter[] = [darukadeAdapter];
 

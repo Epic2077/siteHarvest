@@ -8,6 +8,9 @@ export async function inspectCommand(url: string) {
   const technologies = detectTechnologies(fetched.html, fetched.headers);
   const page = extractGeneric(fetched.url, fetched.html, technologies);
   const adapter = selectAdapter(fetched.url, technologies);
+  if (page.product && adapter.refineProduct) {
+    page.product = await adapter.refineProduct(page.product, page);
+  }
   console.log(JSON.stringify({
     url: fetched.url,
     status: fetched.status,
